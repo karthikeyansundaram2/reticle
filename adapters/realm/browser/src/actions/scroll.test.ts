@@ -57,4 +57,10 @@ describe('scrollContainer', () => {
     expect(typeof r.atEnd).toBe('boolean');
     expect(typeof r.scrolled).toBe('boolean');
   });
+
+  it('5: fraction out of range throws error', () => {
+    const div = scrollableDiv(1000, 200);
+    const ref = refs.refFor(div);
+    expect(() => scrollContainer(ref, undefined, 1.5)).toThrow('fraction');
+  });
 });

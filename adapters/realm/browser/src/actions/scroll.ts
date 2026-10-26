@@ -82,7 +82,10 @@ export function scrollFrom(
 
   const before = target.scrollTop;
   const beforeLeft = target.scrollLeft;
-  if (fraction !== undefined && fraction >= 0 && fraction <= 1) {
+  if (fraction !== undefined) {
+    if (fraction < 0 || fraction > 1) {
+      throw new Error(`fraction ${fraction} out of range (must be between 0 and 1 inclusive)`);
+    }
     target.scrollTop = Math.round(target.scrollHeight * fraction);
   } else {
     // A NEGATIVE dy scrolls back up. The default step is forward, so a plain "reveal the next
