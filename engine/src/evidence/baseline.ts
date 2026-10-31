@@ -13,11 +13,11 @@
  * arbitrary named checkpoints. A `snapshot("cart")` / `compare("cart")` pair is a different feature
  * and has no evidence behind it.
  */
-import { MatchArg, PredicateKind, ReticleCommand } from '@reticlehq/core';
+import { PredicateKind, ReticleCommand } from '@reticlehq/core';
 import type { Predicate } from '@/question/predicate/predicate.js';
 import type { Baseline } from '@/question/predicate/property.js';
 import type { PredicateSession } from '@/question/predicate/predicate-session.js';
-import { textPredicateQuery } from '@/question/predicate/predicate-element.js';
+import { matchOnce, textPredicateQuery } from '@/question/predicate/predicate-element.js';
 
 /** The properties that mean nothing without a before-reading. Mirrors `RELATIVE` in property.ts. */
 const NEEDS_BASELINE: ReadonlySet<string> = new Set([
@@ -47,19 +47,25 @@ function leavesNeedingBaseline(predicate: Predicate, into: Predicate[]): void {
   switch (predicate.kind) {
     case PredicateKind.ALL_OF:
     case PredicateKind.ANY_OF:
-      for (const part of predicate.predicates) leavesNeedingBaseline(part, into);
+      for (const part of predicate.predicates) {
+        leavesNeedingBaseline(part, into);
+      }
       return;
     case PredicateKind.NOT:
       leavesNeedingBaseline(predicate.predicate, into);
       return;
     default:
-      if (asksForComparison(predicate)) into.push(predicate);
+      if (asksForComparison(predicate)) {
+        into.push(predicate);
+      }
   }
 }
 
 /** Does the whole tree need a pre-action reading at all? One walk, so the caller pays nothing. */
 export function needsBaseline(predicate: Predicate | undefined): boolean {
-  if (predicate === undefined) return false;
+  if (predicate === undefined) {
+    return false;
+  }
   const found: Predicate[] = [];
   leavesNeedingBaseline(predicate, found);
   return found.length > 0;
@@ -74,7 +80,9 @@ async function readStateValue(
       ? { path: predicate.path }
       : { store: predicate.store, path: predicate.path };
   const read = await session.command(ReticleCommand.STATE_READ, args);
-  if (!read.ok) return undefined;
+  if (!read.ok) {
+    return undefined;
+  }
   const reply = (read.result ?? {}) as { found?: unknown; value?: unknown };
   // `found: false` is a reading — the path held nothing — and it is NOT the same as "nobody
   // looked". Only an unreadable store returns undefined above.
@@ -88,16 +96,23 @@ async function readText(
   const query = textPredicateQuery(predicate, session.sdkVersion);
   // Read the way the property will read it after the action: a before-reading of the display form
   // against an after-reading of the whole text would call every long text "changed".
-  const match = await session.command(ReticleCommand.MATCH, {
-    query,
-    [MatchArg.FULL_TEXT]: true,
-  });
-  if (!match.ok) return undefined;
-  const elements = ((match.result ?? {}) as { elements?: unknown }).elements;
-  if (!Array.isArray(elements)) return undefined;
+  // Through the verdict's own round-trip, so a page whose SDK refuses `matchCase` is asked again
+  // without it and gets a baseline too. A reply that cannot be read gives no baseline.
+  let match;
+  try {
+    match = await matchOnce(session, query, undefined, undefined, true);
+  } catch {
+    return undefined;
+  }
+  const elements = (match as { elements?: unknown }).elements;
+  if (!Array.isArray(elements)) {
+    return undefined;
+  }
   const text = elements
     .map((element: unknown) => {
-      if ('object' !== typeof element || null === element) return '';
+      if ('object' !== typeof element || null === element) {
+        return '';
+      }
       const value = (element as { text?: unknown }).text;
       return 'string' === typeof value ? value : '';
     })
@@ -119,7 +134,9 @@ export async function captureBaselines(
   predicate: Predicate | undefined,
 ): Promise<ReadonlyMap<Predicate, Baseline>> {
   const captured = new Map<Predicate, Baseline>();
-  if (predicate === undefined) return captured;
+  if (predicate === undefined) {
+    return captured;
+  }
   const leaves: Predicate[] = [];
   leavesNeedingBaseline(predicate, leaves);
   for (const leaf of leaves) {
@@ -130,7 +147,9 @@ export async function captureBaselines(
           : PredicateKind.TEXT === leaf.kind
             ? await readText(session, leaf)
             : undefined;
-      if (reading !== undefined) captured.set(leaf, reading);
+      if (reading !== undefined) {
+        captured.set(leaf, reading);
+      }
     } catch {
       // A reading that could not be taken leaves the leaf with no baseline, which the evaluator
       // reports as `inconclusive`. Throwing here would lose the whole verdict for one unreadable
