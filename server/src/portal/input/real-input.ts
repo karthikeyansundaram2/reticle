@@ -16,12 +16,7 @@ import { pressViaKeyboard } from './real-input-press.js';
 import { stampedDriveUrl } from './drive-url-stamp.js';
 import { launchChromium } from '@/launch-chromium.js';
 import { pageViewportOptions } from '@/chromium-launch-options.js';
-import {
-  chromiumLaunchHint,
-  gotoOptions,
-  SCREENSHOT_DETERMINISM,
-  captureWithChromeHidden,
-} from '@/portal/pool/playwright-launcher.js';
+import { chromiumLaunchHint, gotoOptions } from '@/portal/pool/playwright-launcher.js';
 import { BrowserLaunchKind } from '@reticlehq/core/telemetry';
 import { getSessionMetrics } from '@/telemetry/session-metrics.js';
 import { classifyConnectFailure } from '@/telemetry/connect-failure.js';
@@ -38,6 +33,7 @@ import {
 } from '@reticlehq/core';
 import { installNetworkMocks, type MockRule } from './network-mock.js';
 import { attachNetworkDetail, type NetworkDetail } from './network-detail.js';
+import { attachDownloadCapture, type CdpLike } from './download-capture.js';
 import { injectedConnectArgs } from '@/portal/pool/zero-install.js';
 import { EARLY_CAPTURE_ARG, queueEarlyConsole } from '@/portal/pool/lease-page-error.js';
 
@@ -106,19 +102,9 @@ export interface RealInputResult {
   heldMs?: number;
 }
 
-/** Options for a page screenshot — full-page scroll capture and/or a clip box. */
-export interface ScreenshotOpts {
-  fullPage?: boolean;
-  /** Restrict the capture to one element/region (viewport CSS px). */
-  clip?: ElementBox;
-  /**
-   * A live picture, as a JPEG at this quality: what a person is watching, taken as it is. The
-   * baseline tweaks (hiding the HUD, stopping animations) would make their window flicker each second.
-   */
-  jpegQuality?: number;
-  /** One image pixel per CSS pixel, so a high-density display does not double a step screenshot. */
-  cssScale?: boolean;
-}
+// The screenshot capture lives in page-capture.ts; re-exported for existing importers.
+export { capturePage, type ScreenshotOpts } from './page-capture.js';
+import { capturePage, type ScreenshotOpts } from './page-capture.js';
 
 /** The capability surface reticle_act depends on. A FAKE implementing this is injected in tests. */
 export interface RealInputProvider {
@@ -364,37 +350,6 @@ async function pointerGesture(
     return real(true);
   }
   return real(false);
-}
-
-/**
- * Capture a PNG from a Playwright page. Shared by the CDP + launched providers so the
- * screenshot path lives in one place (mirrors performGesture). Returns the raw PNG bytes.
- */
-export async function capturePage(page: Page, opts: ScreenshotOpts): Promise<Uint8Array> {
-  // A step capture injects nothing into the page, so Reticle's own hosts are hidden another way.
-  if (true === opts.cssScale) {
-    return captureWithChromeHidden({ evaluate: (script: string) => page.evaluate(script) }, () =>
-      shoot(page, opts),
-    );
-  }
-  return shoot(page, opts);
-}
-
-async function shoot(page: Page, opts: ScreenshotOpts): Promise<Uint8Array> {
-  const buf = await page.screenshot(
-    opts.jpegQuality !== undefined
-      ? {
-          type: 'jpeg',
-          quality: opts.jpegQuality,
-          ...(true === opts.cssScale ? { scale: 'css' as const } : {}),
-        }
-      : opts.clip !== undefined
-        ? { ...SCREENSHOT_DETERMINISM, clip: opts.clip }
-        : true === opts.fullPage
-          ? { ...SCREENSHOT_DETERMINISM, fullPage: true }
-          : { ...SCREENSHOT_DETERMINISM },
-  );
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
 interface CdpProviderOptions {
@@ -729,8 +684,16 @@ export class LaunchedRealInputProvider implements OwnedRealInputProvider {
     // Before goto: a console error the page logs while it loads comes before its SDK connects.
     await page.addInitScript(queueEarlyConsole, EARLY_CAPTURE_ARG);
     // Capture CDP-authoritative response detail into the driven session's journal (best-effort).
-    if (this.#onNetworkDetail !== undefined) {
-      attachNetworkDetail(page, this.#onNetworkDetail);
+    const sink = this.#onNetworkDetail;
+    if (sink !== undefined) {
+      attachNetworkDetail(page, sink);
+      // A server-sent download never reaches the page's network events; CDP request interception
+      // does see it (download-capture.ts). Attached before the first navigation, best-effort.
+      await page
+        .context()
+        .newCDPSession(page)
+        .then((cdp) => attachDownloadCapture(cdp as unknown as CdpLike, sink, () => page.url()))
+        .catch(() => undefined);
     }
     try {
       // Same navigation rule as the pool, and for the same measured reason: Playwright's default
