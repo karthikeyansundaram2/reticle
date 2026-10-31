@@ -7,7 +7,7 @@ import {
   type FlowStep,
   type FlowStepResult,
 } from '@reticlehq/core';
-import { crossStepOnly, declaredIn } from './flow-cross-step.js';
+import { crossStepOnly, declaredIn, stepContradictions } from './flow-cross-step.js';
 
 /**
  * The contradictions no per-step window can see, by construction.
@@ -78,5 +78,61 @@ describe('what the whole-span pass is told the flow expected', () => {
       },
     ];
     expect(declaredIn(steps)).toEqual([shown, refused]);
+  });
+});
+
+/*
+ * A flow that clicks Pause and then Resume sends the same POST to a toggle endpoint once per step.
+ * The whole-span pass judged the replay as ONE action, so it read the two as `duplicate-request ×2`
+ * and the flow graded unknown on a working toggle (#2013). "One user action wrote twice" is only a
+ * claim about one step's window, and each step already checks its own.
+ */
+describe('a write repeated across steps', () => {
+  const twice = (kind: Contradiction['kind']): Contradiction => ({
+    kind,
+    claim: 'one user action was performed',
+    counter: 'the same write fired 2 times',
+    detail: 'POST /api/links/abc/pause ×2',
+  });
+
+  it('is not a duplicate request in the whole-span pass', () => {
+    expect(crossStepOnly([twice(ContradictionKind.DUPLICATE_REQUEST)], [step(0), step(1)])).toEqual(
+      [],
+    );
+  });
+
+  it('is not an unrelated duplicate request either', () => {
+    expect(
+      crossStepOnly([twice(ContradictionKind.DUPLICATE_REQUEST_UNRELATED)], [step(0), step(1)]),
+    ).toEqual([]);
+  });
+
+  it('still keeps every other whole-span finding', () => {
+    expect(crossStepOnly([twice(ContradictionKind.DUPLICATE_REQUEST), orphan], [step(0)])).toEqual([
+      orphan,
+    ]);
+  });
+});
+
+/*
+ * A step with no expectation returned before its request was sent; the request started inside the
+ * NEXT step's window and finished after that window closed. The next step read it as
+ * `request-never-settled` and graded unknown on a working sort (f-sort). "Never" can only be judged
+ * when the replay is over, so a step defers it and the whole-span pass decides it.
+ */
+describe('a request still running when a step ends', () => {
+  const inFlight: Contradiction = {
+    kind: ContradictionKind.REQUEST_NEVER_SETTLED,
+    claim: 'the UI moved forward and the action reported done',
+    counter: '1 request(s) were still in flight',
+    detail: 'GET /api/links?sort=-views',
+  };
+
+  it('is not decided by the step window', () => {
+    expect(stepContradictions([inFlight, failed])).toEqual([failed]);
+  });
+
+  it('is still reported by the whole-span pass when it never came back', () => {
+    expect(crossStepOnly([inFlight], [step(0, []), step(1, [])])).toEqual([inFlight]);
   });
 });

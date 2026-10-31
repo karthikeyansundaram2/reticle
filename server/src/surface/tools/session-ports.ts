@@ -126,3 +126,58 @@ export async function sessionMutationPort(
     return undefined;
   }
 }
+
+/**
+ * The state a verify run started in, put back before each flow after the first.
+ *
+ * `reticle verify` replays every flow in ONE driven page. A flow that signs out (an auto-saved
+ * "log out" fragment, or a journey that ends on the logout link) left every later flow signed out,
+ * and each of them then failed for a reason none of them named. The leased suite path never had
+ * this: each flow boots its own context from one captured seed. This gives the single-page path
+ * the same start.
+ *
+ * Call it before each flow. It answers `undefined` to go on, or the reason the flow cannot start
+ * where the run started, which the caller reports as not proved. Nothing to capture (no driven
+ * page, no storage support) means the run goes on as before.
+ */
+export function flowStartState(
+  provider: RealInputProvider | undefined,
+  currentUrl: () => string | undefined,
+): () => Promise<string | undefined> {
+  let first = true;
+  let saved: { state: unknown; url: string } | undefined;
+  return async () => {
+    const url = currentUrl();
+    if (first) {
+      first = false;
+      if (provider === undefined || url === undefined) {
+        return undefined;
+      }
+      try {
+        const port = await fixturePortFor(provider, url);
+        saved = port === undefined ? undefined : { state: await port.capture(), url };
+      } catch {
+        saved = undefined;
+      }
+      return undefined;
+    }
+    if (saved === undefined || provider === undefined) {
+      return undefined;
+    }
+    try {
+      // Straight to the provider, not through `fixturePortFor`: its address check compares the
+      // session's recorded address with the page's, and a flow that reloaded or signed out leaves
+      // the two different while the page is the same. The provider still refuses a page it does
+      // not drive (it answers false), so nothing is restored into a stranger's page.
+      // Tabs first: a tab the previous flow opened is a second connected session otherwise.
+      await provider.closeOtherPages?.();
+      const restored = await provider.applyStorageState?.(url ?? saved.url, saved.state);
+      return true === restored
+        ? undefined
+        : 'could not put the page back in the state the run started with: no driven page matched';
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return `could not put the page back in the state the run started with: ${message}`;
+    }
+  };
+}

@@ -140,6 +140,11 @@ export interface VerifyConnection {
    */
   listFlows(select?: readonly string[]): Promise<string[]>;
   /**
+   * Each named flow's saved step count, for the results score: without it a replay that stopped at
+   * step 2 of 10 reads as a 2-step journey. Optional; a name it cannot read is left out.
+   */
+  plannedSteps?(names: readonly string[]): Promise<ReadonlyMap<string, number>>;
+  /**
    * Drive the app with a model and save what it drove. Present only when a model is configured.
    *
    * Optional on the interface on purpose: the harness is unavailable on a machine with no key, and
@@ -303,7 +308,15 @@ export async function runVerify(args: VerifyArgs, outer: VerifyPorts): Promise<v
     if (args.resultsJson !== undefined && ports.writeResults !== undefined) {
       await ports.writeResults(
         args.resultsJson,
-        `${JSON.stringify(verifyResults(run, pushed), null, 2)}\n`,
+        `${JSON.stringify(
+          verifyResults(
+            run,
+            pushed,
+            (await conn.plannedSteps?.(run.flows.map((f) => f.name))) ?? new Map(),
+          ),
+          null,
+          2,
+        )}\n`,
       );
     }
     ports.out(renderRunReport(run));
@@ -473,6 +486,10 @@ interface LiveOpts {
   sessionId?: string;
   /** `--confirm-dangerous`: acknowledge the replay guard's destructive steps for this run. */
   confirmDangerous?: boolean;
+  /** `--require-start-control`: a missing step 1 control on a fresh start page fails the flow. */
+  requireStartControl?: boolean;
+  /** `--sweep`: keep judging after a step whose consequence failed. */
+  sweep?: boolean;
 }
 
 /** Split a drive URL into its origin + whether it's loopback — decides token/injection pairing. */
@@ -522,10 +539,28 @@ async function openLiveConnection(opts: LiveOpts): Promise<VerifyConnection> {
   const deps = buildVerifyDeps(running, opts.reticleRoot, opts.now);
   const harnessEnv = await withLinkedCredential(deps, process.env);
   const runner = new ReticleRunner(
-    createRunnerPort(deps, opts.sessionId, { confirmDangerous: true === opts.confirmDangerous }),
+    createRunnerPort(deps, opts.sessionId, {
+      confirmDangerous: true === opts.confirmDangerous,
+      requireStartControl: true === opts.requireStartControl,
+      sweep: true === opts.sweep,
+    }),
   );
   return {
     sessionReady: (timeoutMs) => waitForSession(deps.sessions, timeoutMs, opts.now),
+    plannedSteps: async (names) => {
+      const planned = new Map<string, number>();
+      for (const name of names) {
+        const loaded = await deps.flows.load(name).catch(() => undefined);
+        if (true === loaded?.ok) {
+          // A sequence counts its sub-steps, as the score does.
+          planned.set(
+            name,
+            loaded.value.steps.reduce((n, step) => n + (step.steps?.length ?? 1), 0),
+          );
+        }
+      }
+      return planned;
+    },
     listFlows: async (select) =>
       select === undefined || 0 === select.length
         ? deps.flows.list()
@@ -695,8 +730,8 @@ export function routeVerify(args: {
   hasPredicate: boolean;
   /**
    * True when the caller asked for something only a browser of OUR OWN can do: `--headed` or
-   * `--storage-state`. The running daemon's tab can honour neither, so replaying there would
-   * silently ignore the request.
+   * `--storage-state`, or a rule its replay tool does not take (`--require-start-control`). The
+   * running daemon's tab can honour none of them, so replaying there would silently ignore the request.
    */
   wantsOwnBrowser?: boolean;
   /**
@@ -754,6 +789,10 @@ export function handleVerify(
     resultsJson?: string;
     /** Acknowledge the replay guard's destructive steps ("Place order") for this run only. */
     confirmDangerous?: boolean;
+    /** Fail a flow whose step 1 control is missing on its freshly loaded start page. */
+    requireStartControl?: boolean;
+    /** Judge every step, also after one fails. */
+    sweep?: boolean;
   },
   /**
    * Called once, after the last verdict line and before the exit. `cli.ts` passes the CI line:
@@ -810,6 +849,8 @@ export function handleVerify(
         ...(parsed.storageState !== undefined ? { storageState: parsed.storageState } : {}),
         ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
         ...(true === parsed.confirmDangerous ? { confirmDangerous: true } : {}),
+        ...(true === parsed.requireStartControl ? { requireStartControl: true } : {}),
+        ...(true === parsed.sweep ? { sweep: true } : {}),
       }),
     out: (line) => process.stdout.write(`${line}\n`),
     fail: (line) => process.stderr.write(`${line}\n`),
@@ -838,7 +879,12 @@ export function handleVerify(
     const presence = await probePresence(port, { tcpOpen: probeDaemon, status: fetchStatus });
     const plan = routeVerify({
       hasPredicate: expectation !== undefined,
-      wantsOwnBrowser: !parsed.headless || parsed.storageState !== undefined,
+      // `--require-start-control` too: the daemon's replay tool does not take that rule.
+      wantsOwnBrowser:
+        !parsed.headless ||
+        parsed.storageState !== undefined ||
+        true === parsed.requireStartControl ||
+        true === parsed.sweep,
       explore: true === parsed.explore || parsed.persona !== undefined,
       hasSavedFlows:
         0 <

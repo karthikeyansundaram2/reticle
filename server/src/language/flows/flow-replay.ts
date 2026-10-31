@@ -15,6 +15,7 @@ export type { FlowReplaySession, WaitForSignal, Sleep } from './flow-replay-type
 import { routeOfEvent, routeOfUrl } from '@reticlehq/engine/question/predicate/predicate-route.js';
 import { evalConsole } from '@reticlehq/engine/question/predicate/predicate-console.js';
 import { appScope, stepEffect } from '@reticlehq/engine/evidence/step-effect.js';
+import { stepContradictions } from './flow-cross-step.js';
 import {
   AnchorKind,
   DriftReason,
@@ -51,6 +52,7 @@ import {
   SESSION_DISCONNECTED_REASON,
 } from '@/portal/session/facts/session-replaced.js';
 import { actOnResolvedRef } from './flow-step-runners.js';
+import { isPageStep, runPageStep, type OpenPage, type SendRequest } from './steps/page-steps.js';
 
 /**
  * The document this replay was driving went away mid-run.
@@ -77,6 +79,19 @@ export class DocumentLostDuringReplay extends Error {
 }
 
 const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/*
+ * How replay paces itself between steps. A person does not act on a screen that is still changing,
+ * and replay did: it acted the moment the last step's consequence held. An htmx row swap puts a new
+ * button in the page and binds it a moment later, so a click in between did nothing, and a correct
+ * build failed. A busy machine makes that moment longer, so the false fail came under parallel load.
+ *
+ * Quiet means no network, DOM or animation activity for `STEP_QUIET_MS`, which is shorter than any
+ * person takes to act on a changed screen. A page that never goes quiet (a poll, a spinner) gets
+ * `STEP_QUIET_BUDGET_MS` and then the step runs anyway: the wait paces replay and decides nothing.
+ */
+const STEP_QUIET_MS = 250;
+const STEP_QUIET_BUDGET_MS = 2_000;
 
 /**
  * The route (pathname) currently in effect — the page a step runs on. Reads the latest ROUTE_CHANGE
@@ -197,6 +212,14 @@ function lateConsoleDrift(expect: StepExpect, events: ReticleEvent[]): Drift | u
     };
   }
   return undefined;
+}
+
+/** A console-absent expect read over the start-page load, said as such. See `loadSince`. */
+function loadDrift(expect: StepExpect, loadEvents: ReticleEvent[]): Drift | undefined {
+  const drift = 0 === loadEvents.length ? undefined : lateConsoleDrift(expect, loadEvents);
+  return drift === undefined
+    ? undefined
+    : { ...drift, reason: `${drift.reason}, logged while replay loaded the start page` };
 }
 
 /** Run one testid-anchored step: re-resolve via QUERY, then ACT on the live ref, else drift. */
@@ -358,14 +381,16 @@ export async function assertStepExpect(
     ? []
     : inFlightRequestLabels(session.eventsSince(since), session.url, session.background);
   const namedInFlight = namedNetIsInFlight(predicate, openRequests);
+  // The store case keeps its own kind because heal and the run report branch on it; everything
+  // else is a consequence that did not hold, and the reason carries observed-vs-expected.
+  let reasonKind: DriftReason = DriftReason.SIGNAL_NOT_OBSERVED;
+  if (assertsState(expect)) {
+    reasonKind = DriftReason.STATE_MISMATCH;
+  } else if (namedInFlight) {
+    reasonKind = DriftReason.NET_STILL_IN_FLIGHT;
+  }
   return {
-    // The store case keeps its own kind because heal and the run report branch on it; everything
-    // else is a consequence that did not hold, and the reason carries observed-vs-expected.
-    reasonKind: assertsState(expect)
-      ? DriftReason.STATE_MISMATCH
-      : namedInFlight
-        ? DriftReason.NET_STILL_IN_FLIGHT
-        : DriftReason.SIGNAL_NOT_OBSERVED,
+    reasonKind,
     reason: namedInFlight
       ? `${IN_FLIGHT_AT_BUDGET_END} (${openRequests.join(', ')})`
       : withCaseOnly(
@@ -446,6 +471,13 @@ async function runSignalStep(
  */
 export interface ReplayFromOptions {
   /**
+   * Opens the page a `navigate` step names and returns the session of the page that loaded. Supplied
+   * by the caller that owns the sessions. Absent: a `navigate` step fails, never skips.
+   */
+  navigate?: OpenPage<FlowReplaySession>;
+  /** Sends the request a `request` step names. Absent: a `request` step fails, never skips. */
+  request?: SendRequest;
+  /**
    * Told after every step it reports: how many are done, of how many, and whether this one held.
    * The HUD's replay chip draws its progress from this; it must never throw into the replay.
    */
@@ -485,6 +517,15 @@ export interface ReplayFromOptions {
    * replayer had honoured invocations for an hour by then. Two replay paths; one was wired.
    */
   resolveFlow?: (name: string) => Promise<FlowFile | undefined>;
+  /**
+   * Set when replay loaded the start page itself: the session time the load began.
+   *
+   * The load is then part of the journey. An error the page logged while it loaded lands before
+   * step 1 opens its window, so a "no console errors" on step 1 passed over it. Only console-absent
+   * clauses look back to here. A `net` or `text` clause that did so could be satisfied by the load
+   * and not by the step, which is a false pass.
+   */
+  loadSince?: number;
   /** The invocation chain that reached this flow, nearest caller first. Empty at the top. */
   via?: readonly { flow: string; step: number }[];
   /**
@@ -680,6 +721,13 @@ export async function replayFlow(
         index += 1;
         continue;
       }
+      if (index > (options.at ?? 0)) {
+        await waitForSignal(
+          session,
+          { kind: PredicateKind.SETTLED, quietMs: STEP_QUIET_MS },
+          STEP_QUIET_BUDGET_MS,
+        );
+      }
       if (step.invoke !== undefined) {
         results.push(
           await runInvokeStep(
@@ -701,6 +749,38 @@ export async function replayFlow(
         }
         tell(last);
         if (last !== undefined && false === last.ok) {
+          break;
+        }
+        index += 1;
+        continue;
+      }
+      if (isPageStep(step)) {
+        const ran = await runPageStep(step, index, {
+          open: options.navigate,
+          send: options.request,
+          checked: index >= from,
+          confirmDangerous,
+          // A navigated page's clock starts at its own connect, so its whole life is the window.
+          judge: (on, expectation) =>
+            assertStepExpect(on, expectation, waitForSignal, waitFor(step), 0),
+          route: currentRoute,
+        });
+        const result = ran.result;
+        if (ran.session !== undefined) {
+          // The page that asked for the load is gone; every later step runs on the one that loaded.
+          session = ran.session;
+        }
+        if (index < from && result.ok && result.drift === undefined) {
+          index += 1;
+          continue;
+        }
+        if (index < from) {
+          result.note = `setup step for resuming at step ${String(from)} failed`;
+        }
+        await options.onStepResult?.(result, flow.name).catch(() => undefined);
+        results.push(result);
+        tell(result);
+        if (!result.ok || result.drift !== undefined) {
           break;
         }
         index += 1;
@@ -812,6 +892,11 @@ export async function replayFlow(
         result.endPage = endPage;
       }
       const windowEvents = session.eventsSince(cursorBefore).filter((e) => e.t >= cursorBefore);
+      const loadSince = 0 === index ? options.loadSince : undefined;
+      const loadEvents =
+        loadSince === undefined
+          ? []
+          : session.eventsSince(loadSince).filter((e) => e.t < cursorBefore);
       const consequence = summarizeConsequence(windowEvents);
       if (consequence !== undefined) {
         result.consequence = consequence;
@@ -824,7 +909,8 @@ export async function replayFlow(
         if (!result.ok || result.drift !== undefined) {
           break;
         }
-        const late = lateConsoleDrift(expectation, windowEvents);
+        const late =
+          lateConsoleDrift(expectation, windowEvents) ?? loadDrift(expectation, loadEvents);
         if (late !== undefined) {
           result.ok = false;
           result.drift = late;
@@ -836,15 +922,16 @@ export async function replayFlow(
       const cursorAfter = session.elapsed();
       // ONE builder, shared with the live act path, so a driven step and a replayed one describe what
       // happened in identical words rather than in two vocabularies that agree by coincidence.
-      Object.assign(
-        result,
-        stepEffect(
-          windowEvents,
-          { since: cursorBefore, until: cursorAfter },
-          // A failure the step declared is its expected result, as it is on the live path.
-          { ...appScope(session), declared },
-        ),
+      const effect = stepEffect(
+        windowEvents,
+        { since: cursorBefore, until: cursorAfter },
+        // A failure the step declared is its expected result, as it is on the live path.
+        { ...appScope(session), declared },
       );
+      // "Never settled" is decided once the replay is over, by the whole-span pass (flow-cross-step).
+      const stepOwn = stepContradictions(effect.contradictions ?? []);
+      delete effect.contradictions;
+      Object.assign(result, effect, 0 === stepOwn.length ? {} : { contradictions: stepOwn });
       /*
        * A prefix step is setup and is not reported -- UNLESS it failed.
        *
@@ -877,6 +964,15 @@ export async function replayFlow(
         break;
       }
       index += 1;
+    }
+    // And once after the last step: a page can satisfy the last expect at once and finish its own
+    // work after (a sort header marks itself, then fetches the rows). The journey is judged next.
+    if (results.length > 0) {
+      await waitForSignal(
+        session,
+        { kind: PredicateKind.SETTLED, quietMs: STEP_QUIET_MS },
+        STEP_QUIET_BUDGET_MS,
+      );
     }
   } catch (error: unknown) {
     if (!isDocumentGoneError(error)) {

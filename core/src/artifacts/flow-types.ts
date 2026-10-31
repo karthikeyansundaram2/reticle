@@ -49,15 +49,23 @@ export const FlowAnchorSchema = z.discriminatedUnion('kind', [
       .object({ file: z.string(), line: z.number(), column: z.number().optional() })
       .optional(),
   }),
-  z.object({
-    kind: z.literal(AnchorKind.ROLE),
-    role: z.string().min(1),
-    name: z.string().optional(),
-    // Which of several same-named controls was recorded, in page order, and how many there were.
-    // Honoured only while the page still has exactly `of` of them; otherwise the step is ambiguous.
-    nth: z.number().int().min(0).optional(),
-    of: z.number().int().min(2).optional(),
-  }),
+  z
+    .object({
+      kind: z.literal(AnchorKind.ROLE),
+      role: z.string().min(1),
+      name: z.string().optional(),
+      // Which of several same-named controls was recorded, in page order, and how many there were.
+      // Honoured only while the page still has exactly `of` of them; otherwise the step is ambiguous.
+      nth: z.number().int().min(0).optional(),
+      of: z.number().int().min(2).optional(),
+      // Other roles that count as the same control: a spec that allows "a link or a button" is built
+      // either way, and one flow grades every build. A position counts in one role, so not with nth.
+      alsoRoles: z.array(z.string().min(1)).min(1).optional(),
+    })
+    .refine((anchor) => anchor.alsoRoles === undefined || anchor.nth === undefined, {
+      error:
+        '`alsoRoles` cannot be used with `nth`: a position counts the controls of one role only.',
+    }),
   z.object({ kind: z.literal(AnchorKind.SIGNAL), name: z.string().min(1) }),
   // Auto-anchor: re-find an element by component identity / source location when it has no testid.
   // component or source carries the durable signal; role/name are disambiguating extras.
@@ -78,7 +86,9 @@ export type FlowAnchor = z.infer<typeof FlowAnchorSchema>;
 // on the one schema both the save path and the load path go through.
 export const FlowPredicateSchema = PredicateSchema.superRefine((predicate, ctx) => {
   const field = sessionBoundField(predicate);
-  if (field === undefined) return;
+  if (field === undefined) {
+    return;
+  }
   ctx.addIssue({
     code: z.ZodIssueCode.custom,
     message: sessionRefRefusal(field),
@@ -200,6 +210,43 @@ export interface FlowStep {
    * repair would still have to happen in every copy, and the sub-journey could not be reused.
    */
   invoke?: string;
+  /**
+   * The page this step opens, when `tool` is `FlowStepTool.NAVIGATE`: a path on the app (`/u07`),
+   * or a full URL on the app's origin. Replay opens it, goes on with the page that loads, and judges
+   * the step's `expect` there.
+   */
+  navigate?: string;
+  /**
+   * The request this step sends, when `tool` is `FlowStepTool.REQUEST`. `url` is a path on the app
+   * or a full URL on its origin. It goes with the page's cookies, so as the signed-in user, unless
+   * `anonymous` is true. `body` is sent as it is, with `contentType` (JSON when absent).
+   */
+  request?: FlowRequest;
+  /** What the answer to `request` must be. Every field given must hold. */
+  response?: FlowResponse;
+}
+
+export interface FlowRequest {
+  method: string;
+  url: string;
+  body?: string;
+  contentType?: string;
+  anonymous?: boolean;
+  /**
+   * Send as ANOTHER account: the name of a secret that holds that account's `Cookie` header,
+   * supplied at replay (`RETICLE_SECRET_<NAME>`, or the call's `secrets`), never kept in the flow.
+   * A rule about who may change what can only be checked as someone else.
+   */
+  as?: string;
+}
+
+export interface FlowResponse {
+  /** The status code, or one of several. */
+  status?: number | number[];
+  /** A text the body must contain. */
+  contains?: string;
+  /** A text the body must not contain. */
+  absent?: string;
 }
 
 const baseFlowStep = z.object({
@@ -241,6 +288,24 @@ const baseFlowStep = z.object({
   degraded: z.boolean().optional(),
   timeoutMs: z.number().int().nonnegative().optional(),
   invoke: z.string().min(1).optional(),
+  navigate: z.string().min(1).optional(),
+  request: z
+    .object({
+      method: z.string().min(1),
+      url: z.string().min(1),
+      body: z.string().optional(),
+      contentType: z.string().optional(),
+      anonymous: z.boolean().optional(),
+      as: z.string().min(1).optional(),
+    })
+    .optional(),
+  response: z
+    .object({
+      status: z.union([z.number().int(), z.array(z.number().int()).min(1)]).optional(),
+      contains: z.string().optional(),
+      absent: z.string().optional(),
+    })
+    .optional(),
   /** See FlowStep.page / FlowStep.endPage. */
   page: z.string().optional(),
   endPage: z.string().optional(),
@@ -473,7 +538,9 @@ export type FlowFile = z.infer<typeof FlowFileSchema>;
  * excludes nothing, so tidying a flow back into the suite is one field.
  */
 export function isQuarantined(flow: Pick<FlowFile, 'status' | 'quarantine'>): boolean {
-  if (flow.status !== FlowStatus.QUARANTINED) return false;
+  if (flow.status !== FlowStatus.QUARANTINED) {
+    return false;
+  }
   const q = flow.quarantine;
   return (
     q !== undefined &&
@@ -568,7 +635,9 @@ export function flowExpectHasConsequence(expect: Predicate | undefined): boolean
  * false-green question — can the route commit while the view does not render? — answered first.
  */
 export function flowExpectIsPresenceOnly(expect: Predicate | undefined): boolean {
-  if (expect === undefined || flowExpectHasConsequence(expect)) return false;
+  if (expect === undefined || flowExpectHasConsequence(expect)) {
+    return false;
+  }
   // A `compare` reaching here reads text on both sides, which is two readings of the same DOM.
   return expectClauses(expect).some(
     (clause) => PRESENCE_GRADED.has(clause.kind) || PredicateKind.COMPARE === clause.kind,
@@ -583,10 +652,14 @@ export function flowExpectIsPresenceOnly(expect: Predicate | undefined): boolean
  * probe a struct for one key per kind, and a predicate carries its kind on itself.
  */
 function expectClauses(expect: Predicate | undefined): readonly Predicate[] {
-  if (expect === undefined) return [];
+  if (expect === undefined) {
+    return [];
+  }
   if (PredicateKind.ALL_OF === expect.kind || PredicateKind.ANY_OF === expect.kind) {
     return expect.predicates.flatMap(expectClauses);
   }
-  if (PredicateKind.NOT === expect.kind) return expectClauses(expect.predicate);
+  if (PredicateKind.NOT === expect.kind) {
+    return expectClauses(expect.predicate);
+  }
   return [expect];
 }

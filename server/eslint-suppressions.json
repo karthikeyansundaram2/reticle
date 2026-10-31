@@ -285,14 +285,6 @@
       "count": 2
     }
   },
-  "src/command/cli/verify-results.ts": {
-    "curly": {
-      "count": 2
-    },
-    "no-nested-ternary": {
-      "count": 1
-    }
-  },
   "src/command/daemon/binding/daemon-status-probe.test.ts": {
     "curly": {
       "count": 2
@@ -1496,16 +1488,6 @@
       "count": 1
     }
   },
-  "src/language/flows/flow-classify.test.ts": {
-    "curly": {
-      "count": 2
-    }
-  },
-  "src/language/flows/flow-classify.ts": {
-    "curly": {
-      "count": 8
-    }
-  },
   "src/language/flows/flow-expect-grammar.test.ts": {
     "curly": {
       "count": 6
@@ -1561,11 +1543,6 @@
       "count": 1
     }
   },
-  "src/language/flows/flow-replay.console-absent.test.ts": {
-    "curly": {
-      "count": 3
-    }
-  },
   "src/language/flows/flow-replay.dynamic.test.ts": {
     "curly": {
       "count": 1
@@ -1579,16 +1556,6 @@
   "src/language/flows/flow-replay.step-timeout.test.ts": {
     "curly": {
       "count": 3
-    }
-  },
-  "src/language/flows/flow-replay.test.ts": {
-    "curly": {
-      "count": 2
-    }
-  },
-  "src/language/flows/flow-replay.ts": {
-    "no-nested-ternary": {
-      "count": 1
     }
   },
   "src/language/flows/flow-replay.unreachable.test.ts": {
@@ -1851,9 +1818,6 @@
     }
   },
   "src/language/flows/verify-change-tools.ts": {
-    "curly": {
-      "count": 1
-    },
     "no-nested-ternary": {
       "count": 1
     }

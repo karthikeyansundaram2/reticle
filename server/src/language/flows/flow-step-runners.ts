@@ -39,7 +39,8 @@ import {
   expectElementDrift,
   queryOnce,
   reresolved,
-  readNamelessQuery,
+  resolveRoleAnchor,
+  roleQueryArgs,
   resolveQuery,
   roleAnchorLabel,
   testidDrift,
@@ -51,18 +52,6 @@ import { roleDriftReason } from '@/judgement/outcome/role-drift-reason.js';
 /** The live act_sequence tool gives each step this transport budget when none was supplied. */
 export const DEFAULT_SEQUENCE_STEP_TIMEOUT_MS = 8_000;
 
-/** Query args for a NAMED role anchor — the handle that identifies an instance, not a JSX site. */
-function roleQueryArgs(
-  anchor: Extract<FlowAnchor, { kind: typeof AnchorKind.ROLE }>,
-): Record<string, unknown> {
-  return {
-    by: QueryBy.ROLE,
-    value: anchor.role,
-    ...(anchor.name === undefined ? {} : { name: anchor.name }),
-  };
-}
-
-/** Run one role+name-anchored step: re-resolve via QUERY by:'role', ACT on the live ref, else drift. */
 /**
  * The controls actually on the page, as role + name, for the nearest-match scan.
  *
@@ -104,24 +93,6 @@ async function nearestRoleNameOnPage(
     // A drift report must never fail because the suggestion lookup did.
     return null;
   }
-}
-
-/**
- * Resolve a role anchor. ONE function for the first look and the re-resolve after a stale ref: the
- * re-resolve used to count every control of the role, so a nameless anchor's position came back
- * ambiguous on a working page.
- *
- * A nameless anchor's position counts only the nameless controls of its role (an icon-only edit
- * button is the 2nd nameless button of its row, not the 5th button), so it reads only those.
- */
-function resolveRoleAnchor(
-  session: FlowReplaySession,
-  anchor: Extract<FlowAnchor, { kind: typeof AnchorKind.ROLE }>,
-  sleep: Sleep,
-): Promise<{ refs: string[] }> {
-  return anchor.name === undefined
-    ? resolveQuery(session, roleQueryArgs(anchor), sleep, Date.now, readNamelessQuery)
-    : resolveQuery(session, roleQueryArgs(anchor), sleep);
 }
 
 export async function runRoleStep(
@@ -570,9 +541,17 @@ function staleSubStep(
 export function staleTargetResult(
   name: string,
   steps: readonly FlowStepResult[],
+  /**
+   * `startControlRequired`: replay loaded the start page itself, with no redirect, and the caller
+   * asked that a missing step 1 control fail. Then the miss means the app does not offer the control
+   * the journey starts with (#2061), so it stays drift. Without it, the miss is not proved.
+   */
+  options: { startControlRequired?: boolean } = {},
 ): FlowReplayResult | undefined {
   // A target no person could reach is the same kind of answer: nothing about the app was decided.
-  const unreachable = unreachableTargetResult(name, steps) ?? unreachedStepResult(name, steps);
+  const unreached =
+    true === options.startControlRequired ? undefined : unreachedStepResult(name, steps);
+  const unreachable = unreachableTargetResult(name, steps) ?? unreached;
   if (unreachable !== undefined) {
     return unreachable;
   }
@@ -922,16 +901,27 @@ export async function runSequenceStep(
    */
   const judged = (sub: FlowStep): boolean => judge !== undefined && sub.expect !== undefined;
   const declaring = subs.some((sub) => declaredBy(sub) !== undefined || judged(sub));
+  // How many sub-steps completed with their checks held, for the score: a sequence is often a
+  // whole journey. A stretch sent together that failed leaves its sub-steps uncounted (unknown).
+  let completed = 0;
+  const finish = (r: FlowStepResult): FlowStepResult => ({
+    ...r,
+    subSteps: {
+      passed: r.ok && r.drift === undefined ? subs.length : completed,
+      total: subs.length,
+    },
+  });
   for (let next = 0; next < subs.length;) {
     const stretch = await resolveFrom(next);
     if ('stop' in stretch) {
-      return stretch.stop;
+      return finish(stretch.stop);
     }
     const { end } = stretch;
     if (!declaring) {
       if (!(await dispatchFrom(next, end))) {
-        return result;
+        return finish(result);
       }
+      completed = end;
     } else {
       for (let at = next; at < end; at += 1) {
         const sub = subs[at];
@@ -940,11 +930,11 @@ export async function runSequenceStep(
         }
         const since = session.elapsed();
         if (!(await dispatchFrom(at, at + 1))) {
-          return result;
+          return finish(result);
         }
         const testid = declaredBy(sub);
         if (testid !== undefined && !(await assertDeclared(testid))) {
-          return result;
+          return finish(result);
         }
         // The claim is about THIS sub-step: a later one has not run, and an earlier one is before
         // `since`. Judged at the end, a middle route expect failed and a late claim passed early.
@@ -955,11 +945,12 @@ export async function runSequenceStep(
         if (drift !== undefined) {
           result.ok = false;
           result.drift = drift;
-          return result;
+          return finish(result);
         }
+        completed = at + 1;
       }
     }
     next = end;
   }
-  return result;
+  return finish(result);
 }
