@@ -51,13 +51,13 @@ describe('artifact root claims', () => {
     }
   });
 
-  it('refuses a folder with no .reticle and names the path to pass', () => {
+  it('accepts a project folder without a .reticle and resolves to the expected .reticle path', () => {
     const project = mkdtempSync(join(tmpdir(), 'reticle-root-'));
     try {
-      expect(() => claimArtifactRoot('lease-1', project)).toThrow(
-        `Pass ${join(project, '.reticle')}`,
+      claimArtifactRoot('lease-1', project);
+      expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBe(
+        join(project, '.reticle'),
       );
-      expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBeUndefined();
     } finally {
       rmSync(project, { recursive: true, force: true });
     }

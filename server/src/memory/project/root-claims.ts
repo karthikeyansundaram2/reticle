@@ -25,16 +25,21 @@ function resolveArtifactRoot(root: string): string {
   if (!isAbsolute(root)) {
     throw new Error(`root must be an absolute path to a ${ReticleDir.ROOT} folder, got ${root}`);
   }
+  // If the caller already points at a .reticle folder (whether it exists yet or not), use it directly.
   if (ReticleDir.ROOT === basename(root)) {
     return root;
   }
-  const inside = join(root, ReticleDir.ROOT);
-  if (isDirectory(inside)) {
-    return inside;
+  // Otherwise treat the argument as a project folder. It must exist; we will resolve to the
+  // corresponding .reticle sub‑folder, creating it later if necessary.
+  if (!isDirectory(root)) {
+    const inside = join(root, ReticleDir.ROOT);
+    throw new Error(
+      `root must be the ${ReticleDir.ROOT} folder, or a project folder that contains one, got ${root}. Pass ${inside}`,
+    );
   }
-  throw new Error(
-    `root must be the ${ReticleDir.ROOT} folder, or a project folder that contains one, got ${root}. Pass ${inside}`,
-  );
+  const inside = join(root, ReticleDir.ROOT);
+  // Accept the project folder even if the .reticle sub‑folder does not yet exist.
+  return inside;
 }
 
 function isDirectory(path: string): boolean {
